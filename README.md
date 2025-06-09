@@ -6,13 +6,13 @@ The executable demo is a clearly labeled simulation. It does not operate traffic
 
 ## Run the simulation without model weights
 
-Use Python 3.11+:
+Use Python 3.12 (pinned in `.python-version`):
 
 ```sh
 cd smart-traffic-backend
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements-demo.txt
+python -m pip install -r requirements.txt
 ITCS_USE_DUMMY_MODEL=1 uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
@@ -38,7 +38,7 @@ The two existing videos are retained as project assets; their presence is not ev
 
 ## Model-backed path requires separate artifacts
 
-Install `smart-traffic-backend/requirements.txt` only when intentionally setting up the model environment. Supply reviewed, trusted weights at `smart-traffic-backend/weights/best.pt`, then run without the dummy-mode variable. Missing weights fail startup instead of silently substituting a detector. Model metadata must explicitly include an `ambulance` class; class zero is no longer unconditionally relabeled as an ambulance.
+Install `smart-traffic-backend/requirements-model.txt` only when intentionally setting up the model environment. Supply reviewed, trusted weights at `smart-traffic-backend/weights/best.pt`, then run without the dummy-mode variable. Missing weights fail startup instead of silently substituting a detector. Model metadata must explicitly include an `ambulance` class; class zero is no longer unconditionally relabeled as an ambulance.
 
 The weights, training procedure, dataset provenance and evaluation metrics are absent. No checkpoint was downloaded or loaded during this review. Review model-artifact trust and licensing separately before using third-party weights.
 
@@ -61,7 +61,8 @@ Processing stops on the first qualifying ambulance box or after 100 frames. A ne
 
 ```sh
 cd smart-traffic-backend
-ITCS_USE_DUMMY_MODEL=1 python -m pytest -q
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
 ```
 
 Eight tests pass using synthetic NumPy frames and a dummy capture/model: health and simulation labels, positive/negative paths, invalid/empty uploads, the 100-frame cap, no filename-based override, no class-zero remapping, and oversized-upload temporary-file cleanup. OpenCV was installed as a wheel for these tests; Ultralytics and model weights were not installed or executed. A TestClient deprecation warning remains in the verification environment.

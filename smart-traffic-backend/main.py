@@ -1,13 +1,14 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import cv2
-import tempfile
-import os
 import base64
 import logging
+import os
+import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
+
+import cv2
+from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -15,16 +16,20 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST","GET"],
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
+
 
 class PredictionResponse(BaseModel):
     ambulance: bool
     frame: str | None
     confidence: float
-    mode: Literal["simulation", "model"] = "simulation" if os.getenv("ITCS_USE_DUMMY_MODEL") == "1" else "model"
+    mode: Literal["simulation", "model"] = (
+        "simulation" if os.getenv("ITCS_USE_DUMMY_MODEL") == "1" else "model"
+    )
     frames_examined: int = 0
+
 
 class DummyBox:
     def __init__(self, cls_id: int, confidence: float):
@@ -66,14 +71,18 @@ if os.getenv("ITCS_USE_DUMMY_MODEL") == "1":
 else:
     # Load the YOLO model from weights folder once at startup for efficiency.
     logger.info("Loading YOLO model from weights/best.pt...")
-    weights = Path(__file__).resolve().parent / 'weights' / 'best.pt'
+    weights = Path(__file__).resolve().parent / "weights" / "best.pt"
     if not weights.is_file():
-        raise RuntimeError('Missing reviewed weights/best.pt; use ITCS_USE_DUMMY_MODEL=1 only for simulation')
+        raise RuntimeError(
+            "Missing reviewed weights/best.pt; use ITCS_USE_DUMMY_MODEL=1 only for simulation"
+        )
     from ultralytics import YOLO
+
     model = YOLO(str(weights))
-    if 'ambulance' not in [str(name).lower() for name in model.names.values()]:
-        raise RuntimeError('Model must explicitly label an ambulance class')
+    if "ambulance" not in [str(name).lower() for name in model.names.values()]:
+        raise RuntimeError("Model must explicitly label an ambulance class")
     logger.info("Model loaded successfully. Available classes: %s", model.names)
+
 
 @app.get("/health")
 async def health_check():
@@ -81,10 +90,10 @@ async def health_check():
 
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict_video(file: UploadFile = File(...)):
-    suffix = os.path.splitext(file.filename or '')[1]
-    if suffix.lower() not in {'.mp4', '.avi', '.mov', '.mkv', '.webm'}:
-        raise HTTPException(status_code=415, detail='Use a supported video filename')
+async def predict_video(file: Annotated[UploadFile, File()]):
+    suffix = os.path.splitext(file.filename or "")[1]
+    if suffix.lower() not in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
+        raise HTTPException(status_code=415, detail="Use a supported video filename")
     tmp_path = None
     cap = None
 
@@ -96,14 +105,13 @@ async def predict_video(file: UploadFile = File(...)):
             while chunk := await file.read(1024 * 1024):
                 total += len(chunk)
                 if total > 32 * 1024 * 1024:
-                    raise HTTPException(status_code=413, detail='Video must be at most 32 MiB')
+                    raise HTTPException(status_code=413, detail="Video must be at most 32 MiB")
                 tmp.write(chunk)
 
         # Open video and process frames
         cap = cv2.VideoCapture(tmp_path)
         if not cap.isOpened():
-            raise HTTPException(status_code=422, detail='Video could not be decoded')
-        ambulance_detected = False
+            raise HTTPException(status_code=422, detail="Video could not be decoded")
         processed_frame = None
         frame_count = 0
         confidence_threshold = 0.75  # Increase threshold for better accuracy
@@ -119,7 +127,7 @@ async def predict_video(file: UploadFile = File(...)):
                 break
 
             if frame.shape[0] * frame.shape[1] > 3840 * 2160:
-                raise HTTPException(status_code=413, detail='Frame exceeds 4K pixel limit')
+                raise HTTPException(status_code=413, detail="Frame exceeds 4K pixel limit")
             last_frame = frame.copy()
 
             # Run YOLO detection with the trained (or dummy) model
@@ -130,7 +138,7 @@ async def predict_video(file: UploadFile = File(...)):
                 if len(result.boxes) > 0:
                     for box in result.boxes:
                         cls = int(box.cls[0])
-                        class_name = str(model.names.get(cls, '')).lower()
+                        class_name = str(model.names.get(cls, "")).lower()
                         confidence = float(box.conf[0])
 
                         logger.debug("Detected %s with confidence %.4f", class_name, confidence)
@@ -142,8 +150,6 @@ async def predict_video(file: UploadFile = File(...)):
                                 best_frame = result.plot()
 
                             if ambulance_frames >= min_frames_with_ambulance:
-                                ambulance_detected = True
-
                                 _, buffer = cv2.imencode(".jpg", best_frame)
                                 frame_data = base64.b64encode(buffer).decode("utf-8")
 
@@ -192,8 +198,10 @@ async def predict_video(file: UploadFile = File(...)):
             frame_data = base64.b64encode(buffer).decode("utf-8")
 
         if frame_count == 0:
-            raise HTTPException(status_code=422, detail='Video contains no decodable frames')
-        return PredictionResponse(ambulance=False, frame=frame_data, confidence=0.0, frames_examined=frame_count)
+            raise HTTPException(status_code=422, detail="Video contains no decodable frames")
+        return PredictionResponse(
+            ambulance=False, frame=frame_data, confidence=0.0, frames_examined=frame_count
+        )
 
     except HTTPException:
         raise

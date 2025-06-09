@@ -98,16 +98,21 @@ def test_predict_no_ambulance_detected(monkeypatch, tmp_path):
     assert data["confidence"] == 0.0
 
 
-
 def test_unsupported_extension_is_rejected():
     client, _ = create_client()
-    assert client.post('/predict', files={'file': ('notes.txt', b'text', 'text/plain')}).status_code == 415
+    assert (
+        client.post("/predict", files={"file": ("notes.txt", b"text", "text/plain")}).status_code
+        == 415
+    )
 
 
 def test_empty_decoded_video_is_not_reported_as_negative(monkeypatch):
     client, module = create_client()
-    monkeypatch.setattr(module.cv2, 'VideoCapture', lambda path: DummyCapture([]))
-    assert client.post('/predict', files={'file': ('empty.mp4', b'dummy', 'video/mp4')}).status_code == 422
+    monkeypatch.setattr(module.cv2, "VideoCapture", lambda path: DummyCapture([]))
+    assert (
+        client.post("/predict", files={"file": ("empty.mp4", b"dummy", "video/mp4")}).status_code
+        == 422
+    )
 
 
 def test_filename_does_not_force_detection_and_frame_limit_is_100(monkeypatch):
@@ -115,36 +120,43 @@ def test_filename_does_not_force_detection_and_frame_limit_is_100(monkeypatch):
     module.model.detect_ambulance = False
     frames = _build_dummy_frames(110)
     capture = DummyCapture(frames)
-    monkeypatch.setenv('ITCS_DEBUG_MODE', 'true')
-    monkeypatch.setattr(module.cv2, 'VideoCapture', lambda path: capture)
-    result = client.post('/predict', files={'file': ('ambulance.mp4', b'dummy', 'video/mp4')})
+    monkeypatch.setenv("ITCS_DEBUG_MODE", "true")
+    monkeypatch.setattr(module.cv2, "VideoCapture", lambda path: capture)
+    result = client.post("/predict", files={"file": ("ambulance.mp4", b"dummy", "video/mp4")})
     assert result.status_code == 200
-    assert result.json()['ambulance'] is False
-    assert result.json()['frames_examined'] == 100
+    assert result.json()["ambulance"] is False
+    assert result.json()["frames_examined"] == 100
     assert capture._index == 100
 
 
 def test_other_class_is_not_remapped_to_ambulance(monkeypatch):
     client, module = create_client()
     module.model.detect_ambulance = True
-    monkeypatch.setattr(module.model, 'names', {0: 'person'})
-    monkeypatch.setattr(module.cv2, 'VideoCapture', lambda path: DummyCapture(_build_dummy_frames(1)))
-    result = client.post('/predict', files={'file': ('sample.mp4', b'dummy', 'video/mp4')})
+    monkeypatch.setattr(module.model, "names", {0: "person"})
+    monkeypatch.setattr(
+        module.cv2, "VideoCapture", lambda path: DummyCapture(_build_dummy_frames(1))
+    )
+    result = client.post("/predict", files={"file": ("sample.mp4", b"dummy", "video/mp4")})
     assert result.status_code == 200
-    assert result.json()['ambulance'] is False
+    assert result.json()["ambulance"] is False
 
 
 def test_oversized_upload_is_rejected_and_temporary_file_removed(monkeypatch):
     client, module = create_client()
     import tempfile
     from pathlib import Path
+
     created = []
     original = tempfile.NamedTemporaryFile
+
     def track(*args, **kwargs):
         value = original(*args, **kwargs)
         created.append(value.name)
         return value
-    monkeypatch.setattr(module.tempfile, 'NamedTemporaryFile', track)
-    result = client.post('/predict', files={'file': ('large.mp4', b'x' * (32 * 1024 * 1024 + 1), 'video/mp4')})
+
+    monkeypatch.setattr(module.tempfile, "NamedTemporaryFile", track)
+    result = client.post(
+        "/predict", files={"file": ("large.mp4", b"x" * (32 * 1024 * 1024 + 1), "video/mp4")}
+    )
     assert result.status_code == 413
     assert created and all(not Path(path).exists() for path in created)

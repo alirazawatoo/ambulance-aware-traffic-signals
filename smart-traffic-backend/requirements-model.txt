@@ -1,0 +1,4 @@
+# Model-backed mode: adds Ultralytics YOLO (AGPL-3.0) and, through it, PyTorch.
+# For CPU-only torch: pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements-model.txt
+-r requirements.txt
+ultralytics==8.4.208
