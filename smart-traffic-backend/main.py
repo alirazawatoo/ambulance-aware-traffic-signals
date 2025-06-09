@@ -7,10 +7,19 @@ from typing import Annotated, Literal
 
 import cv2
 from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+SUPPORTED_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+MAX_FRAMES = 100
+MAX_FRAME_PIXELS = 3840 * 2160
+CONFIDENCE_THRESHOLD = 0.75
+WEIGHTS_PATH = Path(__file__).resolve().parent / "weights" / "best.pt"
 
 app = FastAPI()
 app.add_middleware(
@@ -25,10 +34,8 @@ class PredictionResponse(BaseModel):
     ambulance: bool
     frame: str | None
     confidence: float
-    mode: Literal["simulation", "model"] = (
-        "simulation" if os.getenv("ITCS_USE_DUMMY_MODEL") == "1" else "model"
-    )
-    frames_examined: int = 0
+    mode: Literal["simulation", "model"]
+    frames_examined: int
 
 
 class DummyBox:
@@ -44,15 +51,14 @@ class DummyResult:
         self.boxes = boxes
 
     def plot(self):
-        # For tests we do not need to draw boxes; returning the frame is enough.
         return self._frame
 
 
 class DummyModel:
     """
-    Lightweight stand-in for the YOLO model, used in automated tests.
-    This avoids loading large model weights and makes the service
-    deterministic during testing.
+    Stand-in for the YOLO model in simulation mode and tests: no weights are
+    loaded, and it reports an ambulance on every frame while detect_ambulance
+    is set, regardless of the video content.
     """
 
     def __init__(self):
@@ -65,155 +71,137 @@ class DummyModel:
         return [DummyResult(source, [])]
 
 
-if os.getenv("ITCS_USE_DUMMY_MODEL") == "1":
-    logger.info("Using DummyModel for YOLO predictions (ITCS_USE_DUMMY_MODEL=1).")
-    model = DummyModel()
-else:
-    # Load the YOLO model from weights folder once at startup for efficiency.
-    logger.info("Loading YOLO model from weights/best.pt...")
-    weights = Path(__file__).resolve().parent / "weights" / "best.pt"
-    if not weights.is_file():
+def load_model():
+    if os.getenv("ITCS_USE_DUMMY_MODEL") == "1":
+        logger.info("Using DummyModel for YOLO predictions (ITCS_USE_DUMMY_MODEL=1).")
+        return DummyModel()
+    if not WEIGHTS_PATH.is_file():
         raise RuntimeError(
             "Missing reviewed weights/best.pt; use ITCS_USE_DUMMY_MODEL=1 only for simulation"
         )
     from ultralytics import YOLO
 
-    model = YOLO(str(weights))
-    if "ambulance" not in [str(name).lower() for name in model.names.values()]:
+    yolo = YOLO(str(WEIGHTS_PATH))
+    if "ambulance" not in [str(name).lower() for name in yolo.names.values()]:
         raise RuntimeError("Model must explicitly label an ambulance class")
-    logger.info("Model loaded successfully. Available classes: %s", model.names)
+    logger.info("Model loaded. Available classes: %s", yolo.names)
+    return yolo
+
+
+model = load_model()
+
+
+def current_mode() -> Literal["simulation", "model"]:
+    return "simulation" if isinstance(model, DummyModel) else "model"
+
+
+def encode_jpeg(frame) -> str:
+    ok, buffer = cv2.imencode(".jpg", frame)
+    if not ok:
+        raise RuntimeError("JPEG encoding failed")
+    return base64.b64encode(buffer).decode("ascii")
+
+
+def label_no_ambulance(frame):
+    labeled = frame.copy()
+    cv2.putText(
+        labeled, "No Ambulance Detected", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
+    )
+    return labeled
+
+
+def strongest_ambulance(results):
+    """Return (confidence, result) for the most confident qualifying ambulance box, or None."""
+    best = None
+    for result in results:
+        for box in result.boxes:
+            class_name = str(model.names.get(int(box.cls[0]), "")).lower()
+            confidence = float(box.conf[0])
+            logger.debug("Detected %s with confidence %.4f", class_name, confidence)
+            if class_name != "ambulance" or confidence < CONFIDENCE_THRESHOLD:
+                continue
+            if best is None or confidence > best[0]:
+                best = (confidence, result)
+    return best
+
+
+def scan_video(path: str) -> PredictionResponse:
+    """Decode up to MAX_FRAMES frames and stop at the first qualifying ambulance.
+
+    Decoding and inference block, so the endpoint runs this on a worker thread.
+    """
+    cap = cv2.VideoCapture(path)
+    try:
+        if not cap.isOpened():
+            raise HTTPException(status_code=422, detail="Video could not be decoded")
+        first_frame = None
+        frames_examined = 0
+        while frames_examined < MAX_FRAMES:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame.shape[0] * frame.shape[1] > MAX_FRAME_PIXELS:
+                raise HTTPException(status_code=413, detail="Frame exceeds 4K pixel limit")
+            frames_examined += 1
+            if first_frame is None:
+                first_frame = frame
+
+            results = model.predict(source=frame, conf=CONFIDENCE_THRESHOLD, save=False)
+            hit = strongest_ambulance(results)
+            if hit is not None:
+                confidence, result = hit
+                return PredictionResponse(
+                    ambulance=True,
+                    frame=encode_jpeg(result.plot()),
+                    confidence=confidence,
+                    mode=current_mode(),
+                    frames_examined=frames_examined,
+                )
+
+        if first_frame is None:
+            raise HTTPException(status_code=422, detail="Video contains no decodable frames")
+        return PredictionResponse(
+            ambulance=False,
+            frame=encode_jpeg(label_no_ambulance(first_frame)),
+            confidence=0.0,
+            mode=current_mode(),
+            frames_examined=frames_examined,
+        )
+    finally:
+        cap.release()
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "mode": "simulation" if isinstance(model, DummyModel) else "model"}
+    return {"status": "ok", "mode": current_mode()}
 
 
 @app.post("/predict", response_model=PredictionResponse)
 async def predict_video(file: Annotated[UploadFile, File()]):
-    suffix = os.path.splitext(file.filename or "")[1]
-    if suffix.lower() not in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in SUPPORTED_SUFFIXES:
         raise HTTPException(status_code=415, detail="Use a supported video filename")
     tmp_path = None
-    cap = None
-
     try:
-        # Persist the uploaded file to a temporary location for OpenCV.
+        # OpenCV needs a real file path, so the upload is spooled to disk with a size cap.
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
             total = 0
-            while chunk := await file.read(1024 * 1024):
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
                 total += len(chunk)
-                if total > 32 * 1024 * 1024:
+                if total > MAX_UPLOAD_BYTES:
                     raise HTTPException(status_code=413, detail="Video must be at most 32 MiB")
                 tmp.write(chunk)
-
-        # Open video and process frames
-        cap = cv2.VideoCapture(tmp_path)
-        if not cap.isOpened():
-            raise HTTPException(status_code=422, detail="Video could not be decoded")
-        processed_frame = None
-        frame_count = 0
-        confidence_threshold = 0.75  # Increase threshold for better accuracy
-        min_frames_with_ambulance = 1  # Only require one frame for demo
-        ambulance_frames = 0
-        highest_confidence = 0.0
-        best_frame = None
-        last_frame = None
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            if frame.shape[0] * frame.shape[1] > 3840 * 2160:
-                raise HTTPException(status_code=413, detail="Frame exceeds 4K pixel limit")
-            last_frame = frame.copy()
-
-            # Run YOLO detection with the trained (or dummy) model
-            results = model.predict(source=frame, conf=confidence_threshold, save=False)
-
-            # Check if any detected object is an ambulance
-            for result in results:
-                if len(result.boxes) > 0:
-                    for box in result.boxes:
-                        cls = int(box.cls[0])
-                        class_name = str(model.names.get(cls, "")).lower()
-                        confidence = float(box.conf[0])
-
-                        logger.debug("Detected %s with confidence %.4f", class_name, confidence)
-
-                        if class_name == "ambulance" and confidence >= confidence_threshold:
-                            ambulance_frames += 1
-                            if confidence > highest_confidence:
-                                highest_confidence = confidence
-                                best_frame = result.plot()
-
-                            if ambulance_frames >= min_frames_with_ambulance:
-                                _, buffer = cv2.imencode(".jpg", best_frame)
-                                frame_data = base64.b64encode(buffer).decode("utf-8")
-
-                                return PredictionResponse(
-                                    ambulance=True,
-                                    frame=frame_data,
-                                    confidence=highest_confidence,
-                                    frames_examined=frame_count + 1,
-                                )
-
-            # Process at most 100 frames to avoid long processing times
-            frame_count += 1
-            if frame_count >= 100:
-                break
-
-            # Save the current frame as processed_frame for non-ambulance case
-            if processed_frame is None and frame is not None:
-                labeled_frame = frame.copy()
-                cv2.putText(
-                    labeled_frame,
-                    "No Ambulance Detected",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0, 0, 255),
-                    2,
-                )
-                processed_frame = labeled_frame
-
-        frame_data = None
-        if processed_frame is not None:
-            _, buffer = cv2.imencode(".jpg", processed_frame)
-            frame_data = base64.b64encode(buffer).decode("utf-8")
-        elif last_frame is not None:
-            labeled_frame = last_frame.copy()
-            cv2.putText(
-                labeled_frame,
-                "No Ambulance Detected",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 255),
-                2,
-            )
-            _, buffer = cv2.imencode(".jpg", labeled_frame)
-            frame_data = base64.b64encode(buffer).decode("utf-8")
-
-        if frame_count == 0:
-            raise HTTPException(status_code=422, detail="Video contains no decodable frames")
-        return PredictionResponse(
-            ambulance=False, frame=frame_data, confidence=0.0, frames_examined=frame_count
-        )
-
+        return await run_in_threadpool(scan_video, tmp_path)
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Video processing failed")
+        logger.exception("Video processing failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to process video.",
         ) from exc
     finally:
         await file.close()
-        if cap is not None:
-            cap.release()
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)

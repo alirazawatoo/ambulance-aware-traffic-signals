@@ -1,5 +1,7 @@
+import asyncio
 import importlib
 import os
+import threading
 
 import numpy as np
 from fastapi.testclient import TestClient
@@ -16,6 +18,7 @@ class DummyCapture:
     def __init__(self, frames):
         self._frames = frames
         self._index = 0
+        self.released = False
 
     def isOpened(self):
         return True
@@ -28,7 +31,7 @@ class DummyCapture:
         return True, frame
 
     def release(self):
-        pass
+        self.released = True
 
 
 def _build_dummy_frames(count: int = 5):
@@ -160,3 +163,82 @@ def test_oversized_upload_is_rejected_and_temporary_file_removed(monkeypatch):
     )
     assert result.status_code == 413
     assert created and all(not Path(path).exists() for path in created)
+
+
+def _post_video(client, name="clip.mp4"):
+    return client.post("/predict", files={"file": (name, b"dummy", "video/mp4")})
+
+
+def test_inference_runs_off_the_event_loop(monkeypatch):
+    client, module = create_client()
+    module.model.detect_ambulance = True
+    loop_threads = []
+    original_predict = module.model.predict
+
+    def predict(**kwargs):
+        try:
+            asyncio.get_running_loop()
+            loop_threads.append(threading.current_thread().name)
+        except RuntimeError:
+            pass
+        return original_predict(**kwargs)
+
+    monkeypatch.setattr(module.model, "predict", predict)
+    monkeypatch.setattr(
+        module.cv2, "VideoCapture", lambda path: DummyCapture(_build_dummy_frames(2))
+    )
+    assert _post_video(client).status_code == 200
+    assert loop_threads == []
+
+
+def test_detection_on_a_later_frame_reports_frames_examined(monkeypatch):
+    client, module = create_client()
+    module.model.detect_ambulance = False
+    calls = []
+    original_predict = module.model.predict
+
+    def predict(**kwargs):
+        calls.append(1)
+        module.model.detect_ambulance = len(calls) == 3
+        return original_predict(**kwargs)
+
+    monkeypatch.setattr(module.model, "predict", predict)
+    capture = DummyCapture(_build_dummy_frames(10))
+    monkeypatch.setattr(module.cv2, "VideoCapture", lambda path: capture)
+    data = _post_video(client).json()
+    assert data["ambulance"] is True
+    assert data["frames_examined"] == 3
+    assert capture._index == 3
+    assert capture.released
+
+
+def test_frame_larger_than_4k_is_rejected(monkeypatch):
+    client, module = create_client()
+    frames = [np.zeros((2161, 3841, 3), dtype=np.uint8)]
+    monkeypatch.setattr(module.cv2, "VideoCapture", lambda path: DummyCapture(frames))
+    response = _post_video(client)
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Frame exceeds 4K pixel limit"
+
+
+def test_jpeg_encoding_failure_is_a_server_error(monkeypatch):
+    client, module = create_client()
+    module.model.detect_ambulance = True
+    monkeypatch.setattr(
+        module.cv2, "VideoCapture", lambda path: DummyCapture(_build_dummy_frames(1))
+    )
+    monkeypatch.setattr(module.cv2, "imencode", lambda ext, frame: (False, None))
+    response = _post_video(client)
+    assert response.status_code == 500
+    assert response.json()["detail"] == "Failed to process video."
+
+
+def test_mode_comes_from_the_loaded_model(monkeypatch):
+    client, module = create_client()
+    module.model.detect_ambulance = False
+    monkeypatch.setattr(
+        module.cv2, "VideoCapture", lambda path: DummyCapture(_build_dummy_frames(1))
+    )
+    assert _post_video(client).json()["mode"] == "simulation"
+    monkeypatch.setattr(module, "current_mode", lambda: "model")
+    assert _post_video(client).json()["mode"] == "model"
