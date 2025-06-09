@@ -283,3 +283,17 @@ def test_committed_sample_clip_decodes():
     finally:
         capture.release()
     assert frames == 12
+
+
+def test_cors_origins_default_to_any(monkeypatch):
+    client, module = create_client()
+    monkeypatch.delenv("ITCS_CORS_ORIGINS", raising=False)
+    assert module.allowed_origins() == ["*"]
+    response = client.get("/health", headers={"Origin": "http://example.test"})
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_cors_origins_can_be_restricted(monkeypatch):
+    _, module = create_client()
+    monkeypatch.setenv("ITCS_CORS_ORIGINS", "http://localhost:5173, https://ops.example.test,")
+    assert module.allowed_origins() == ["http://localhost:5173", "https://ops.example.test"]

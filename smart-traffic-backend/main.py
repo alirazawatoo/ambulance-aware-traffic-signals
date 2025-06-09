@@ -21,10 +21,17 @@ MAX_FRAME_PIXELS = 3840 * 2160
 CONFIDENCE_THRESHOLD = 0.75
 WEIGHTS_PATH = Path(__file__).resolve().parent / "weights" / "best.pt"
 
-app = FastAPI()
+
+def allowed_origins() -> list[str]:
+    """Comma-separated ITCS_CORS_ORIGINS; "*" (the default) allows any origin."""
+    raw = os.getenv("ITCS_CORS_ORIGINS", "*")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+app = FastAPI(title="Ambulance priority video API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins(),
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
