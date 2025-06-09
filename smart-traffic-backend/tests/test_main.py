@@ -1,10 +1,15 @@
 import asyncio
+import base64
 import importlib
 import os
 import threading
+from pathlib import Path
 
+import cv2
 import numpy as np
 from fastapi.testclient import TestClient
+
+from scripts.make_synthetic_clip import write_clip
 
 
 def create_client():
@@ -242,3 +247,39 @@ def test_mode_comes_from_the_loaded_model(monkeypatch):
     assert _post_video(client).json()["mode"] == "simulation"
     monkeypatch.setattr(module, "current_mode", lambda: "model")
     assert _post_video(client).json()["mode"] == "model"
+
+
+def test_real_decode_of_a_synthetic_clip(tmp_path):
+    client, module = create_client()
+    module.model.detect_ambulance = False
+    clip = write_clip(tmp_path / "synthetic.avi", frames=7)
+    with clip.open("rb") as handle:
+        response = client.post(
+            "/predict", files={"file": ("synthetic.avi", handle, "video/x-msvideo")}
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ambulance"] is False
+    assert data["frames_examined"] == 7
+    preview = cv2.imdecode(
+        np.frombuffer(base64.b64decode(data["frame"]), np.uint8), cv2.IMREAD_COLOR
+    )
+    assert preview.shape == (180, 320, 3)
+
+
+def test_bytes_that_are_not_video_are_rejected_by_the_real_decoder():
+    client, _ = create_client()
+    response = client.post("/predict", files={"file": ("broken.mp4", b"not a video", "video/mp4")})
+    assert response.status_code == 422
+
+
+def test_committed_sample_clip_decodes():
+    sample = Path(__file__).resolve().parent.parent / "samples" / "synthetic-traffic.avi"
+    capture = cv2.VideoCapture(str(sample))
+    try:
+        frames = 0
+        while capture.read()[0]:
+            frames += 1
+    finally:
+        capture.release()
+    assert frames == 12
